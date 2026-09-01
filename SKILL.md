@@ -37,12 +37,11 @@ Determine the review source first — the page needs a unified diff plus metadat
 else in the workflow is identical for both.
 
 **GitHub PR** (URL or number given):
-1. Prefer the repo's own PR-context script when one exists (a wrapper that returns
-   bounded PR metadata, files, commits, reviews, checks, and the full diff as JSON —
-   check the repo's scripts/docs directory for one). Cap the diff at ~200k chars
-   (`--include-diff --max-diff-chars 200000 --json` or equivalent).
-   Otherwise fall back to plain GitHub CLI: `gh pr view` + `gh pr diff` /
-   `gh api repos/OWNER/REPO/pulls/NN`.
+1. Use the bundled context script (resolve relative to this skill directory):
+   `<skill-dir>/scripts/pr-context <PR> --include-diff --max-diff-chars 200000 --json`.
+   It returns bounded PR metadata, files, commits, reviews, checks, and the diff as
+   JSON. If the script or the `gh` CLI is unavailable, fall back to
+   `gh pr view` + `gh pr diff` / `gh api repos/OWNER/REPO/pulls/NN`.
 2. Header data comes from the PR: number, title, base/head branch, body summary,
    feature-flag notes.
 

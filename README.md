@@ -22,15 +22,26 @@ feature branch vs base, commit range).
 
 ## Install
 
-Copy or clone this folder into your agent's skills directory:
-
 ```bash
-git clone <this-repo> ~/.agents/skills/pr-review-page
+git clone --recurse-submodules <this-repo> ~/.agents/skills/pr-review-page
 ```
 
-Requires an agent with shell + file access. Optional: Playwright or any headless
-browser for the built-in verification step.
+Requires: an agent with shell + file access, Python 3 (stdlib only) for
+`scripts/pr-context`, and the [GitHub CLI](https://cli.github.com/) (`gh`) authenticated.
+Optional: Playwright or any headless browser for the built-in verification step.
 
+## Bundled scripts
+
+- `scripts/pr-context` — bounded, read-only GitHub PR context report (metadata,
+  files, commits, reviews, checks, optional capped diff) as JSON. Pure-stdlib
+  Python, no mutations, no fetches.
+
+## Bundled submodule
+
+- `diagram-design/` — [cathrynlavery/diagram-design](https://github.com/cathrynlavery/diagram-design)
+  (MIT), a diagram-generation skill. Useful companion when a review page needs
+  richer diagrams; shipped as a submodule, not vendored — update with
+  `git submodule update --remote`.
 ## Usage
 
 Tell your agent:
@@ -44,6 +55,8 @@ Tell your agent:
 
 - `SKILL.md` — the skill instructions
 - `assets/pr-review-page-template.html` — the HTML template the agent fills in
+- `scripts/pr-context` — bounded PR context script (see above)
+- `diagram-design/` — submodule of the diagram-design skill
 
 ## License
 

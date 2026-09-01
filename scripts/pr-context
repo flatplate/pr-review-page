@@ -1,0 +1,1242 @@
+#!/usr/bin/env python3
+"""Produce a bounded, read-only GitHub pull request context report."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+SCHEMA_VERSION = 1
+MAX_BODY_CHARS = 4_000
+MAX_SUMMARY_BODY_CHARS = 500
+MAX_COMMIT_MESSAGE_CHARS = 500
+MAX_FILES = 100
+MAX_COMMITS = 100
+MAX_API_ITEMS = 100
+MAX_THREAD_PAGES = 20
+DEFAULT_MAX_DIFF_CHARS = 20_000
+DEFAULT_MAX_COMMENTS = 20
+MAX_DIFF_CHARS_LIMIT = 200_000
+MAX_CHECKS = 100
+MAX_CHECK_FIELD_CHARS = 300
+MAX_CHECK_URL_CHARS = 2_000
+MAX_CHECK_PROJECTION_CHARS = 384_000
+
+OWNER_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+REPOSITORY_COMPONENT = r"[A-Za-z0-9_.-]{1,100}"
+PR_URL_RE = re.compile(
+    rf"^https?://github\.com/({OWNER_COMPONENT})/({REPOSITORY_COMPONENT})/pull/(\d+)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+PR_SHORT_RE = re.compile(rf"^({OWNER_COMPONENT})/({REPOSITORY_COMPONENT})#(\d+)$")
+REPO_RE = re.compile(rf"^{OWNER_COMPONENT}/{REPOSITORY_COMPONENT}$")
+
+
+class ContextError(Exception):
+    """An actionable error that should be shown without a traceback."""
+
+
+@dataclass
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class Diagnostics:
+    def __init__(self) -> None:
+        self.messages: set[str] = set()
+
+    def warn(self, message: str) -> None:
+        if message not in self.messages:
+            self.messages.add(message)
+            print(f"warning: {message}", file=sys.stderr)
+
+
+def command_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PAGER": "cat",
+        }
+    )
+    return env
+
+
+def run_command(args: list[str], cwd: Path | None = None) -> CommandResult:
+    env = command_env()
+    try:
+        process = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        if args and args[0] == "gh":
+            raise ContextError("gh was not found on PATH; install GitHub CLI and run 'gh auth login'.") from exc
+        raise ContextError(f"required command was not found: {args[0]}") from exc
+    return CommandResult(process.returncode, process.stdout, process.stderr)
+
+
+def run_command_prefix(
+    args: list[str], max_chars: int, cwd: Path | None = None
+) -> tuple[CommandResult, bool]:
+    """Retain at most max_chars+1 stdout characters and stop the producer."""
+    try:
+        with tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                args,
+                cwd=str(cwd) if cwd else None,
+                env=command_env(),
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert process.stdout is not None
+            stdout = process.stdout.read(max_chars + 1)
+            truncated = len(stdout) > max_chars
+            if truncated and process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            stderr_file.seek(0)
+            stderr = stderr_file.read(8_192).decode("utf-8", errors="replace")
+    except FileNotFoundError as exc:
+        if args and args[0] == "gh":
+            raise ContextError(
+                "gh was not found on PATH; install GitHub CLI and run 'gh auth login'."
+            ) from exc
+        raise ContextError(f"required command was not found: {args[0]}") from exc
+    return CommandResult(process.returncode, stdout, stderr), truncated
+
+
+def parse_json_result(result: CommandResult, description: str) -> Any:
+    if result.returncode != 0:
+        raise ContextError(format_gh_error(result, description))
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ContextError(f"gh returned invalid JSON while {description}: {exc}") from exc
+
+
+def format_gh_error(result: CommandResult, description: str) -> str:
+    detail = (result.stderr or result.stdout).strip()
+    lower = detail.lower()
+    if any(token in lower for token in ("authentication", "not logged", "auth login", "bad credentials")):
+        return f"GitHub authentication failed while {description}; run 'gh auth login'. ({detail})"
+    if "404" in lower or "not found" in lower or "no pull requests found" in lower:
+        return f"pull request not found while {description}; verify the repository and PR number. ({detail})"
+    if not detail:
+        detail = f"gh exited with status {result.returncode}"
+    return f"GitHub CLI failed while {description}: {detail}"
+
+
+def gh_json(args: list[str], description: str, cwd: Path | None = None) -> Any:
+    return parse_json_result(run_command(["gh", *args], cwd), description)
+
+
+def bounded_text(value: Any, limit: int) -> dict[str, Any]:
+    text = value if isinstance(value, str) else ""
+    truncated = len(text) > limit
+    return {
+        "text": text[:limit],
+        "truncated": truncated,
+        "original_chars": len(text),
+    }
+
+
+def git(args: list[str], cwd: Path) -> CommandResult:
+    return run_command(["git", "-C", str(cwd), *args])
+
+
+def discover_git_root(path: Path) -> Path | None:
+    result = git(["rev-parse", "--show-toplevel"], path)
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def remote_to_repo(remote: str) -> str | None:
+    """Resolve github.com remotes only; never reinterpret another host as GitHub."""
+    remote = remote.strip()
+    if not remote:
+        return None
+    path: str | None = None
+    if "://" in remote:
+        parsed = urlparse(remote)
+        if (parsed.hostname or "").lower() != "github.com":
+            return None
+        if parsed.scheme not in {"http", "https", "ssh", "git"}:
+            return None
+        path = parsed.path
+    else:
+        match = re.fullmatch(r"(?:[^@/:]+@)?github\.com:(.+)", remote, re.IGNORECASE)
+        if not match:
+            return None
+        path = match.group(1)
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path if REPO_RE.fullmatch(path) else None
+
+
+def git_repositories(root: Path) -> list[str]:
+    result = git(["remote"], root)
+    if result.returncode != 0:
+        return []
+    names = [name for name in result.stdout.splitlines() if name]
+    if "origin" in names:
+        names.remove("origin")
+        names.insert(0, "origin")
+    repositories: list[str] = []
+    for name in names:
+        url_result = git(["remote", "get-url", name], root)
+        if url_result.returncode == 0:
+            repository = remote_to_repo(url_result.stdout)
+            if repository and repository.lower() not in {item.lower() for item in repositories}:
+                repositories.append(repository)
+    return repositories
+
+
+def parse_pr_reference(reference: str) -> tuple[str | None, int]:
+    if reference.isdigit() and int(reference) > 0:
+        return None, int(reference)
+    url_match = PR_URL_RE.fullmatch(reference)
+    if url_match:
+        return f"{url_match.group(1)}/{url_match.group(2)}", int(url_match.group(3))
+    short_match = PR_SHORT_RE.fullmatch(reference)
+    if short_match:
+        return f"{short_match.group(1)}/{short_match.group(2)}", int(short_match.group(3))
+    raise ContextError(
+        f"invalid PR reference {reference!r}; use a number, PR URL, or OWNER/REPO#NUMBER."
+    )
+
+
+def parse_repo_option(value: str | None) -> tuple[Path | None, str | None]:
+    if value is None:
+        return None, None
+    candidate = Path(value).expanduser()
+    if candidate.exists():
+        if not candidate.is_dir():
+            raise ContextError(f"--repo path is not a directory: {candidate}")
+        root = discover_git_root(candidate.resolve())
+        if root is None:
+            raise ContextError(f"--repo path is not inside a Git repository: {candidate}")
+        repositories = git_repositories(root)
+        if not repositories:
+            raise ContextError(f"no parseable Git remote found in --repo path: {root}")
+        return root, repositories[0]
+    if REPO_RE.fullmatch(value):
+        return None, value.removesuffix(".git")
+    raise ContextError(f"--repo must be an existing Git path or OWNER/REPO, got {value!r}")
+
+
+def resolve_target(args: argparse.Namespace) -> tuple[Path | None, str, int]:
+    option_root, option_repo = parse_repo_option(args.repo)
+    cwd_root = discover_git_root(Path.cwd())
+    local_root = option_root or cwd_root
+    reference_repo: str | None = None
+    number: int | None = None
+    if args.pr:
+        reference_repo, number = parse_pr_reference(args.pr)
+
+    if (
+        reference_repo
+        and option_repo
+        and option_root is None
+        and reference_repo.lower() != option_repo.lower()
+    ):
+        raise ContextError(
+            f"PR reference names {reference_repo}, but --repo names {option_repo}; choose one repository."
+        )
+    repository = reference_repo or option_repo
+    if repository is None and local_root:
+        repositories = git_repositories(local_root)
+        repository = repositories[0] if repositories else None
+    if repository is None:
+        raise ContextError(
+            "could not determine OWNER/REPO; run inside a Git repository with a remote, "
+            "pass --repo OWNER/REPO, or use OWNER/REPO#NUMBER."
+        )
+
+    if number is None:
+        if local_root:
+            branch_result = git(["symbolic-ref", "--quiet", "--short", "HEAD"], local_root)
+            if branch_result.returncode != 0:
+                raise ContextError(
+                    "cannot infer a pull request from detached HEAD; pass a PR number, URL, "
+                    "or OWNER/REPO#NUMBER."
+                )
+        # Let gh use the local remote/branch relationship when a path (or no
+        # --repo) supplied the repository. This is important for branches in a
+        # fork: the PR number and URL belong to the upstream base repository.
+        repo_option_is_path = bool(args.repo and Path(args.repo).expanduser().exists())
+        inference_args = ["pr", "view"]
+        if args.repo and not repo_option_is_path:
+            inference_args.extend(["--repo", repository])
+        inference_args.extend(["--json", "number,url"])
+        inference = gh_json(
+            inference_args,
+            "inferring a pull request from the current branch",
+            local_root,
+        )
+        try:
+            number = int(inference["number"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContextError("gh did not return a PR number for the current branch.") from exc
+        inferred_url = inference.get("url") if isinstance(inference, dict) else None
+        if isinstance(inferred_url, str):
+            match = PR_URL_RE.fullmatch(inferred_url)
+            if match:
+                inferred_repo = f"{match.group(1)}/{match.group(2)}"
+                if args.repo and not repo_option_is_path and inferred_repo.lower() != repository.lower():
+                    raise ContextError(
+                        f"inferred PR belongs to {inferred_repo}, not requested repository {repository}."
+                    )
+                repository = inferred_repo
+    return local_root, repository, number
+
+
+def optional_api_list(
+    endpoint: str,
+    description: str,
+    diagnostics: Diagnostics,
+    cwd: Path | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    result = run_command(["gh", "api", endpoint], cwd)
+    if result.returncode != 0:
+        diagnostics.warn(format_gh_error(result, description))
+        return [], False
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        diagnostics.warn(f"gh returned invalid JSON while {description}; that section is unavailable")
+        return [], False
+    if not isinstance(data, list):
+        diagnostics.warn(f"GitHub returned an unexpected shape while {description}; that section is unavailable")
+        return [], False
+    return [item for item in data if isinstance(item, dict)], True
+
+
+def parse_included_json_list(
+    result: CommandResult, description: str
+) -> tuple[list[dict[str, Any]], int]:
+    if result.returncode != 0:
+        raise ContextError(format_gh_error(result, description))
+    output = result.stdout
+    separator = "\r\n\r\n" if "\r\n\r\n" in output else "\n\n"
+    if separator in output:
+        header_text, body = output.rsplit(separator, 1)
+    else:
+        header_text, body = "", output
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ContextError(f"gh returned invalid JSON while {description}: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ContextError(f"GitHub returned an unexpected shape while {description}")
+    last_page = 1
+    for match in re.finditer(r"<([^>]+)>;\s*rel=\"last\"", header_text, re.IGNORECASE):
+        values = parse_qs(urlparse(match.group(1)).query).get("page")
+        if values and values[-1].isdigit():
+            last_page = max(last_page, int(values[-1]))
+    return [item for item in payload if isinstance(item, dict)], last_page
+
+
+def fetch_latest_reviews(
+    repository: str,
+    number: int,
+    diagnostics: Diagnostics,
+    cwd: Path | None,
+) -> tuple[list[dict[str, Any]], bool, int | None]:
+    description = "querying latest reviews"
+    first_endpoint = f"repos/{repository}/pulls/{number}/reviews?per_page={MAX_API_ITEMS}&page=1"
+    first = run_command(["gh", "api", first_endpoint, "--include"], cwd)
+    try:
+        reviews, last_page = parse_included_json_list(first, description)
+    except ContextError as exc:
+        diagnostics.warn(f"{exc}; that section is unavailable")
+        return [], False, None
+    if last_page > 1:
+        reviews, available = optional_api_list(
+            f"repos/{repository}/pulls/{number}/reviews?per_page={MAX_API_ITEMS}&page={last_page}",
+            description,
+            diagnostics,
+            cwd,
+        )
+        if not available:
+            return [], False, None
+    total = (last_page - 1) * MAX_API_ITEMS + len(reviews)
+    return reviews, True, total
+
+
+def compact_commit(item: dict[str, Any]) -> dict[str, Any]:
+    commit = item.get("commit") if isinstance(item.get("commit"), dict) else {}
+    author_data = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    user = item.get("author") if isinstance(item.get("author"), dict) else {}
+    message = bounded_text(commit.get("message"), MAX_COMMIT_MESSAGE_CHARS)
+    return {
+        "sha": item.get("sha"),
+        "author": user.get("login") or author_data.get("name"),
+        "authored_at": author_data.get("date"),
+        "message": message,
+        "url": item.get("html_url"),
+    }
+
+
+def review_summaries(
+    reviews: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    max_comments: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    summaries: list[dict[str, Any]] = []
+    for review in reviews:
+        user = review.get("user") if isinstance(review.get("user"), dict) else {}
+        summaries.append(
+            {
+                "type": "review",
+                "author": user.get("login"),
+                "state": review.get("state"),
+                "created_at": review.get("submitted_at"),
+                "url": review.get("html_url"),
+                "body": bounded_text(review.get("body"), MAX_SUMMARY_BODY_CHARS),
+            }
+        )
+    for comment in comments:
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        summaries.append(
+            {
+                "type": "comment",
+                "author": user.get("login"),
+                "state": None,
+                "created_at": comment.get("created_at"),
+                "url": comment.get("html_url"),
+                "body": bounded_text(comment.get("body"), MAX_SUMMARY_BODY_CHARS),
+            }
+        )
+    summaries.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return summaries[:max_comments], len(summaries) > max_comments
+
+
+def latest_reviewer_states(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose bounded per-reviewer facts without imitating branch-protection policy."""
+    latest: dict[str, dict[str, Any]] = {}
+    ordered = sorted(reviews, key=lambda item: item.get("submitted_at") or "")
+    for review in ordered:
+        user = review.get("user") if isinstance(review.get("user"), dict) else {}
+        author = user.get("login")
+        state = review.get("state")
+        if not isinstance(author, str) or not isinstance(state, str):
+            continue
+        latest[author[:MAX_CHECK_FIELD_CHARS]] = {
+            "author": author[:MAX_CHECK_FIELD_CHARS],
+            "state": state[:100],
+            "submitted_at": review.get("submitted_at"),
+        }
+    return sorted(latest.values(), key=lambda item: item["author"].lower())[:MAX_API_ITEMS]
+
+
+THREAD_QUERY = """
+query($owner:String!, $name:String!, $number:Int!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewDecision
+      reviewThreads(first:100, after:$cursor) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(last:1) {
+            nodes { author { login } body createdAt url }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def fetch_review_threads(
+    repository: str,
+    number: int,
+    max_comments: int,
+    diagnostics: Diagnostics,
+    cwd: Path | None,
+) -> tuple[dict[str, Any], str | None]:
+    owner, name = repository.split("/", 1)
+    cursor: str | None = None
+    unresolved: list[dict[str, Any]] = []
+    review_decision: str | None = None
+    complete = True
+    for page in range(MAX_THREAD_PAGES):
+        command = [
+            "gh", "api", "graphql",
+            "-f", f"query={THREAD_QUERY}",
+            "-F", f"owner={owner}",
+            "-F", f"name={name}",
+            "-F", f"number={number}",
+        ]
+        if cursor:
+            command.extend(["-F", f"cursor={cursor}"])
+        result = run_command(command, cwd)
+        if result.returncode != 0:
+            diagnostics.warn(
+                format_gh_error(result, "querying review decision and unresolved review threads")
+                + "; continuing without GraphQL review-thread data"
+            )
+            return {
+                "available": False,
+                "unresolved_count": None,
+                "count_is_lower_bound": False,
+                "summaries": [],
+                "truncated": False,
+                "limit": max_comments,
+            }, None
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            diagnostics.warn("gh returned invalid GraphQL JSON; review-thread data is unavailable")
+            return {
+                "available": False,
+                "unresolved_count": None,
+                "count_is_lower_bound": False,
+                "summaries": [],
+                "truncated": False,
+                "limit": max_comments,
+            }, None
+        if payload.get("errors"):
+            diagnostics.warn("GitHub GraphQL returned errors; review-thread data may be unavailable")
+        try:
+            pull_request = payload["data"]["repository"]["pullRequest"]
+            threads = pull_request["reviewThreads"]
+            nodes = threads.get("nodes") or []
+            page_info = threads.get("pageInfo") or {}
+        except (KeyError, TypeError):
+            diagnostics.warn(
+                "GitHub GraphQL response lacks reviewThreads (possibly permissions or an API field difference); "
+                "continuing with review data from REST"
+            )
+            return {
+                "available": False,
+                "unresolved_count": None,
+                "count_is_lower_bound": False,
+                "summaries": [],
+                "truncated": False,
+                "limit": max_comments,
+            }, None
+        if page == 0 and isinstance(pull_request.get("reviewDecision"), str):
+            review_decision = pull_request["reviewDecision"]
+        for thread in nodes:
+            if not isinstance(thread, dict) or thread.get("isResolved") is True:
+                continue
+            comments_data = thread.get("comments") if isinstance(thread.get("comments"), dict) else {}
+            latest_nodes = comments_data.get("nodes") if isinstance(comments_data.get("nodes"), list) else []
+            latest = latest_nodes[-1] if latest_nodes and isinstance(latest_nodes[-1], dict) else {}
+            author = latest.get("author") if isinstance(latest.get("author"), dict) else {}
+            unresolved.append(
+                {
+                    "path": thread.get("path"),
+                    "line": thread.get("line") or thread.get("originalLine"),
+                    "outdated": bool(thread.get("isOutdated")),
+                    "author": author.get("login"),
+                    "created_at": latest.get("createdAt"),
+                    "url": latest.get("url"),
+                    "body": bounded_text(latest.get("body"), MAX_SUMMARY_BODY_CHARS),
+                }
+            )
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            complete = False
+            diagnostics.warn("review-thread pagination stopped because GitHub omitted an end cursor")
+            break
+    else:
+        complete = False
+        diagnostics.warn(
+            f"review-thread scan reached its safety limit ({MAX_THREAD_PAGES * 100} threads); "
+            "the unresolved count is a lower bound"
+        )
+    unresolved.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return {
+        "available": True,
+        "unresolved_count": len(unresolved),
+        "count_is_lower_bound": not complete,
+        "summaries": unresolved[:max_comments],
+        "truncated": len(unresolved) > max_comments,
+        "limit": max_comments,
+    }, review_decision
+
+
+def check_category(item: dict[str, Any]) -> str:
+    bucket = str(item.get("bucket") or "").lower()
+    if bucket in {"pass", "passed"}:
+        return "passed"
+    if bucket in {"fail", "failed", "cancel"}:
+        return "failed"
+    if bucket in {"skipping", "skipped"}:
+        return "skipped"
+    if bucket == "pending":
+        return "pending"
+    state = str(item.get("state") or "").upper()
+    if state in {"SUCCESS"}:
+        return "passed"
+    if state in {"SKIPPED", "NEUTRAL"}:
+        return "skipped"
+    if state in {
+        "ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "CANCELLED",
+    }:
+        return "failed"
+    return "pending"
+
+
+def checks_projection() -> str:
+    return f'''\
+def category:
+  ((.bucket // "") | tostring | ascii_downcase) as $bucket |
+  ((.state // "") | tostring | ascii_upcase) as $state |
+  if ($bucket == "pass" or $bucket == "passed" or $state == "SUCCESS") then "passed"
+  elif ($bucket == "skipping" or $bucket == "skipped" or $state == "SKIPPED" or $state == "NEUTRAL") then "skipped"
+  elif ($bucket == "fail" or $bucket == "failed" or $bucket == "cancel" or
+        (["ERROR","FAILURE","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE","STALE","CANCELLED"] | index($state))) then "failed"
+  else "pending" end;
+def clipped($value; $limit):
+  (($value // "") | tostring) as $text |
+  {{text: $text[0:$limit], truncated: (($text | length) > $limit)}};
+. as $all |
+{{
+  total: ($all | length),
+  category_totals: (reduce $all[] as $item
+    ({{failed:0,pending:0,passed:0,skipped:0}};
+     ($item | category) as $category | .[$category] += 1)),
+  items: ([$all[] |
+    . as $raw | category as $category |
+    clipped($raw.name; {MAX_CHECK_FIELD_CHARS}) as $name |
+    clipped($raw.state; {MAX_CHECK_FIELD_CHARS}) as $state |
+    clipped($raw.workflow; {MAX_CHECK_FIELD_CHARS}) as $workflow |
+    clipped($raw.link; {MAX_CHECK_URL_CHARS}) as $url |
+    {{category:$category,name:$name.text,state:$state.text,workflow:$workflow.text,url:$url.text,
+      fields_truncated:($name.truncated or $state.truncated or $workflow.truncated or $url.truncated)}}]
+    | sort_by(if .category == "failed" then 0 elif .category == "pending" then 1 elif .category == "passed" then 2 else 3 end,
+              .workflow, .name)
+    | .[:{MAX_CHECKS}])
+}}'''
+
+
+def unavailable_checks() -> dict[str, Any]:
+    return {
+        "available": False,
+        "total": None,
+        "category_totals": {"failed": None, "pending": None, "passed": None, "skipped": None},
+        "failed": [],
+        "pending": [],
+        "passed": [],
+        "skipped": [],
+        "truncated": False,
+        "limit": MAX_CHECKS,
+    }
+
+
+def fetch_checks(
+    repository: str,
+    number: int,
+    diagnostics: Diagnostics,
+    cwd: Path | None,
+) -> dict[str, Any]:
+    projection = checks_projection()
+
+    def invoke(fields: str) -> tuple[CommandResult, bool, Any]:
+        result, output_truncated = run_command_prefix(
+            [
+                "gh", "pr", "checks", str(number), "--repo", repository,
+                "--json", fields, "--jq", projection,
+            ],
+            MAX_CHECK_PROJECTION_CHARS,
+            cwd,
+        )
+        try:
+            payload = json.loads(result.stdout) if result.stdout.strip() else None
+        except json.JSONDecodeError:
+            payload = None
+        return result, output_truncated, payload
+
+    result, output_truncated, data = invoke("bucket,name,state,link,workflow")
+    if not isinstance(data, dict) and not output_truncated:
+        fallback, output_truncated, data = invoke("bucket,name,state")
+        if isinstance(data, dict):
+            diagnostics.warn("gh lacks newer check JSON fields; using the compatible bucket/name/state shape")
+            result = fallback
+        else:
+            detail = (fallback.stderr or result.stderr or fallback.stdout or result.stdout).strip()
+            if "no checks" in detail.lower():
+                data = {"total": 0, "category_totals": {name: 0 for name in ("failed", "pending", "passed", "skipped")}, "items": []}
+            else:
+                diagnostics.warn(
+                    format_gh_error(fallback, "querying PR checks")
+                    + "; check data is unavailable"
+                )
+                return unavailable_checks()
+    if output_truncated or not isinstance(data, dict):
+        diagnostics.warn("bounded check projection exceeded its safety cap; check data is unavailable")
+        return unavailable_checks()
+
+    totals_data = data.get("category_totals") if isinstance(data.get("category_totals"), dict) else {}
+    category_totals = {
+        name: max(0, int(totals_data.get(name) or 0))
+        for name in ("failed", "pending", "passed", "skipped")
+    }
+    total = max(0, int(data.get("total") or sum(category_totals.values())))
+    grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in category_totals}
+    raw_items = data.get("items") if isinstance(data.get("items"), list) else []
+    for raw in raw_items[:MAX_CHECKS]:
+        if not isinstance(raw, dict):
+            continue
+        category = raw.get("category")
+        if category not in grouped:
+            continue
+        values = {}
+        any_truncated = bool(raw.get("fields_truncated"))
+        for key, limit in (
+            ("name", MAX_CHECK_FIELD_CHARS),
+            ("state", MAX_CHECK_FIELD_CHARS),
+            ("workflow", MAX_CHECK_FIELD_CHARS),
+            ("url", MAX_CHECK_URL_CHARS),
+        ):
+            text = str(raw.get(key) or "")
+            any_truncated = any_truncated or len(text) > limit
+            values[key] = text[:limit]
+        values["fields_truncated"] = any_truncated
+        grouped[category].append(values)
+    returned = sum(len(items) for items in grouped.values())
+    return {
+        "available": True,
+        "total": total,
+        "category_totals": category_totals,
+        **grouped,
+        "truncated": total > returned,
+        "limit": MAX_CHECKS,
+    }
+
+
+def parse_porcelain_z(output: str) -> list[dict[str, Any]]:
+    records = output.split("\0")
+    files: list[dict[str, Any]] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        status = record[:2]
+        path = record[3:] if len(record) > 3 else ""
+        item: dict[str, Any] = {"path": path, "status": status}
+        if "R" in status or "C" in status:
+            if index < len(records):
+                item["original_path"] = records[index]
+                index += 1
+        files.append(item)
+    return files
+
+
+def local_context(
+    root: Path | None,
+    base_repository: str,
+    head_repository: str | None,
+    base_sha: str | None,
+    head_sha: str | None,
+    disabled: bool,
+    diagnostics: Diagnostics,
+) -> dict[str, Any]:
+    empty = {
+        "available": False,
+        "reason": "disabled" if disabled else "no_matching_local_repository",
+        "root": None,
+        "repository_match": None,
+        "branch": None,
+        "detached": False,
+        "status_available": False,
+        "dirty_file_count": None,
+        "dirty_files": [],
+        "dirty_files_truncated": False,
+        "ahead": None,
+        "behind": None,
+        "range": None,
+        "range_available": False,
+    }
+    if disabled or root is None:
+        return empty
+    local_repositories = git_repositories(root)
+    match: str | None = None
+    if any(repo.lower() == base_repository.lower() for repo in local_repositories):
+        match = "base"
+    elif head_repository and any(repo.lower() == head_repository.lower() for repo in local_repositories):
+        match = "head"
+    if match is None:
+        diagnostics.warn(
+            f"local repository remotes do not match PR base {base_repository}"
+            + (f" or head {head_repository}" if head_repository else "")
+            + "; omitting local Git comparisons"
+        )
+        return empty
+
+    branch_result = git(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    status_result = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], root)
+    status_available = status_result.returncode == 0
+    dirty = parse_porcelain_z(status_result.stdout) if status_available else []
+    if not status_available:
+        diagnostics.warn(
+            "could not read local Git status; working-tree cleanliness is unknown"
+        )
+    range_text = f"{base_sha}...{head_sha}" if base_sha and head_sha else None
+    ahead: int | None = None
+    behind: int | None = None
+    range_available = False
+    if base_sha and head_sha:
+        counts = git(["rev-list", "--left-right", "--count", range_text], root)
+        if counts.returncode == 0:
+            pieces = counts.stdout.split()
+            if len(pieces) == 2:
+                behind, ahead = int(pieces[0]), int(pieces[1])
+                range_available = True
+        else:
+            diagnostics.warn(
+                "PR base/head commits are not both present locally; no fetch was performed, so ahead/behind is unavailable"
+            )
+    else:
+        diagnostics.warn("GitHub omitted a base or head SHA; local ahead/behind is unavailable")
+    return {
+        "available": True,
+        "reason": None,
+        "root": str(root),
+        "repository_match": match,
+        "branch": branch,
+        "detached": branch is None,
+        "status_available": status_available,
+        "dirty_file_count": len(dirty) if status_available else None,
+        "dirty_files": dirty[:MAX_FILES],
+        "dirty_files_truncated": len(dirty) > MAX_FILES,
+        "ahead": ahead,
+        "behind": behind,
+        "range": range_text,
+        "range_available": range_available,
+    }
+
+
+def fetch_diff(
+    repository: str,
+    number: int,
+    max_chars: int,
+    diagnostics: Diagnostics,
+    cwd: Path | None,
+) -> dict[str, Any]:
+    result, output_truncated = run_command_prefix(
+        [
+            "gh", "api", f"repos/{repository}/pulls/{number}",
+            "-H", "Accept: application/vnd.github.v3.diff",
+        ],
+        max_chars,
+        cwd,
+    )
+    if result.returncode != 0 and not output_truncated:
+        diagnostics.warn(format_gh_error(result, "querying the PR diff") + "; diff is unavailable")
+        return {
+            "included": True,
+            "available": False,
+            "text": "",
+            "truncated": False,
+            "original_chars": None,
+            "original_chars_is_lower_bound": False,
+            "limit": max_chars,
+        }
+    text = result.stdout[:max_chars]
+    return {
+        "included": True,
+        "available": True,
+        "text": text,
+        "truncated": output_truncated,
+        "original_chars": max_chars + 1 if output_truncated else len(text),
+        "original_chars_is_lower_bound": output_truncated,
+        "limit": max_chars,
+    }
+
+
+def build_report(args: argparse.Namespace, diagnostics: Diagnostics) -> dict[str, Any]:
+    local_root, requested_repository, number = resolve_target(args)
+    core = gh_json(
+        ["api", f"repos/{requested_repository}/pulls/{number}"],
+        f"loading {requested_repository}#{number}",
+        local_root,
+    )
+    if not isinstance(core, dict):
+        raise ContextError("GitHub returned an unexpected PR response shape.")
+
+    base = core.get("base") if isinstance(core.get("base"), dict) else {}
+    head = core.get("head") if isinstance(core.get("head"), dict) else {}
+    base_repo_data = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    head_repo_data = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    repository = base_repo_data.get("full_name") or requested_repository
+    if str(repository).lower() != requested_repository.lower():
+        raise ContextError(
+            f"GitHub returned PR data for {repository}, not requested repository {requested_repository}."
+        )
+    head_repository = head_repo_data.get("full_name")
+    total_files = int(core.get("changed_files") or 0)
+    total_commits = int(core.get("commits") or 0)
+
+    files, files_available = optional_api_list(
+        f"repos/{repository}/pulls/{number}/files?per_page={MAX_FILES}",
+        "querying changed files",
+        diagnostics,
+        local_root,
+    )
+    commits, commits_available = optional_api_list(
+        f"repos/{repository}/pulls/{number}/commits?per_page={MAX_COMMITS}",
+        "querying commits",
+        diagnostics,
+        local_root,
+    )
+    reviews, reviews_available, review_total = fetch_latest_reviews(
+        repository, number, diagnostics, local_root
+    )
+    comment_total = int(core.get("comments") or 0)
+    comment_page = max(1, math.ceil(comment_total / MAX_API_ITEMS))
+    comments, comments_available = optional_api_list(
+        f"repos/{repository}/issues/{number}/comments?per_page={MAX_API_ITEMS}&page={comment_page}",
+        "querying PR comments",
+        diagnostics,
+        local_root,
+    )
+
+    summaries, summaries_truncated = review_summaries(reviews, comments, args.max_comments)
+    threads, graphql_decision = fetch_review_threads(
+        repository, number, args.max_comments, diagnostics, local_root
+    )
+    decision = graphql_decision
+    if graphql_decision is None:
+        diagnostics.warn(
+            "GitHub's aggregate review decision is unavailable; per-reviewer states "
+            "are reported without inferring branch-protection policy"
+        )
+    checks = fetch_checks(repository, number, diagnostics, local_root)
+
+    file_items = []
+    for item in files[:MAX_FILES]:
+        file_items.append(
+            {
+                "path": item.get("filename"),
+                "status": item.get("status"),
+                "additions": item.get("additions"),
+                "deletions": item.get("deletions"),
+                "changes": item.get("changes"),
+                "previous_path": item.get("previous_filename"),
+            }
+        )
+    commit_items = [compact_commit(item) for item in commits[:MAX_COMMITS]]
+    user = core.get("user") if isinstance(core.get("user"), dict) else {}
+    result: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "repository": repository,
+        "pull_request": {
+            "number": int(core.get("number") or number),
+            "url": core.get("html_url") or f"https://github.com/{repository}/pull/{number}",
+            "title": core.get("title") or "",
+            "body": bounded_text(core.get("body"), MAX_BODY_CHARS),
+            "author": user.get("login"),
+            "state": core.get("state"),
+            "draft": bool(core.get("draft")),
+            "base": {
+                "repository": repository,
+                "ref": base.get("ref"),
+                "sha": base.get("sha"),
+            },
+            "head": {
+                "repository": head_repository,
+                "ref": head.get("ref"),
+                "sha": head.get("sha"),
+                "is_fork": bool(head_repository and str(head_repository).lower() != str(repository).lower()),
+            },
+            "additions": int(core.get("additions") or 0),
+            "deletions": int(core.get("deletions") or 0),
+            "file_count": total_files,
+        },
+        "changed_files": {
+            "available": files_available,
+            "total": total_files,
+            "items": file_items,
+            "truncated": total_files > len(file_items),
+            "limit": MAX_FILES,
+        },
+        "commits": {
+            "available": commits_available,
+            "total": total_commits,
+            "items": commit_items,
+            "truncated": total_commits > len(commit_items),
+            "limit": MAX_COMMITS,
+        },
+        "review": {
+            "decision": decision,
+            "reviews_available": reviews_available,
+            "comments_available": comments_available,
+            "review_count_returned": len(reviews),
+            "review_count": review_total,
+            "comment_count": comment_total,
+            "latest_reviewer_states": latest_reviewer_states(reviews),
+            "summaries": summaries,
+            "truncated": summaries_truncated or (review_total or 0) > len(reviews) or comment_total > len(comments),
+            "limit": args.max_comments,
+        },
+        "review_threads": threads,
+        "checks": checks,
+        "local": local_context(
+            local_root,
+            repository,
+            head_repository,
+            base.get("sha"),
+            head.get("sha"),
+            args.no_local,
+            diagnostics,
+        ),
+        "diff": {
+            "included": False,
+            "available": False,
+            "text": "",
+            "truncated": False,
+            "original_chars": None,
+            "original_chars_is_lower_bound": False,
+            "limit": args.max_diff_chars,
+        },
+    }
+    if args.include_diff:
+        result["diff"] = fetch_diff(
+            repository, number, args.max_diff_chars, diagnostics, local_root
+        )
+    return result
+
+
+def human_text(report: dict[str, Any]) -> str:
+    pr = report["pull_request"]
+    lines = [
+        f"PR {report['repository']}#{pr['number']}: {pr['title']}",
+        f"URL: {pr['url']}",
+        f"Author: {pr['author'] or '-'}  State: {pr['state'] or '-'}"
+        + (" (draft)" if pr["draft"] else ""),
+        f"Base/head: {pr['base']['ref'] or '-'} <- {pr['head']['repository'] or '-'}:{pr['head']['ref'] or '-'}",
+        f"Changes: +{pr['additions']} -{pr['deletions']} in {pr['file_count']} files",
+    ]
+    body = pr["body"]
+    if body["text"]:
+        suffix = " [truncated]" if body["truncated"] else ""
+        lines.extend(["", f"Body{suffix}:", body["text"]])
+
+    changed = report["changed_files"]
+    lines.extend(["", f"Changed files ({len(changed['items'])}/{changed['total']}):"])
+    lines.extend(
+        f"  {item['status'] or '?':>8}  {item['path']} (+{item['additions'] or 0}/-{item['deletions'] or 0})"
+        for item in changed["items"]
+    )
+    if changed["truncated"]:
+        lines.append(f"  [truncated at {changed['limit']} files; inspect with 'gh pr diff --name-only']")
+
+    commits = report["commits"]
+    lines.extend(["", f"Commits ({len(commits['items'])}/{commits['total']}):"])
+    for commit in commits["items"]:
+        first_line = commit["message"]["text"].splitlines()[0] if commit["message"]["text"] else ""
+        lines.append(f"  {(commit['sha'] or '')[:8]}  {commit['author'] or '-'}  {first_line}")
+    if commits["truncated"]:
+        lines.append(f"  [truncated at {commits['limit']} commits]")
+
+    review = report["review"]
+    lines.extend(["", f"Review decision: {review['decision'] or '-'}"])
+    for summary in review["summaries"]:
+        state = f" [{summary['state']}]" if summary["state"] else ""
+        body_line = summary["body"]["text"].replace("\n", " ")
+        lines.append(f"  {summary['type']} by {summary['author'] or '-'}{state}: {body_line}")
+    if review["truncated"]:
+        lines.append(
+            f"  [review/comment summary truncated; rerun with --max-comments greater than {review['limit']}]"
+        )
+
+    threads = report["review_threads"]
+    if threads["available"]:
+        count = f">={threads['unresolved_count']}" if threads["count_is_lower_bound"] else str(threads["unresolved_count"])
+        lines.append(f"Unresolved review threads: {count}")
+        for thread in threads["summaries"]:
+            location = f"{thread['path'] or '?'}:{thread['line'] or '?'}"
+            body_line = thread["body"]["text"].replace("\n", " ")
+            lines.append(f"  {location} by {thread['author'] or '-'}: {body_line}")
+        if threads["truncated"]:
+            lines.append(
+                f"  [thread summaries truncated; rerun with --max-comments greater than {threads['limit']}]"
+            )
+    else:
+        lines.append("Unresolved review threads: unavailable (see stderr warning)")
+
+    checks = report["checks"]
+    if checks["available"]:
+        lines.extend(
+            [
+                "Checks: "
+                + ", ".join(
+                    f"{name}={checks['category_totals'][name]}"
+                    for name in ("failed", "pending", "passed", "skipped")
+                )
+            ]
+        )
+        for category in ("failed", "pending"):
+            for check in checks[category]:
+                lines.append(f"  {category}: {check['name']} ({check['state'] or '-'})")
+        if checks["truncated"]:
+            lines.append(
+                f"  [check details truncated at {checks['limit']} items; totals include all checks]"
+            )
+    else:
+        lines.append("Checks: unavailable (see stderr warning)")
+
+    local = report["local"]
+    lines.append("")
+    if local["available"]:
+        branch = "detached HEAD" if local["detached"] else local["branch"]
+        dirty_count = (
+            str(local["dirty_file_count"])
+            if local["status_available"]
+            else "unknown"
+        )
+        lines.append(
+            f"Local: {local['root']} [{branch}], dirty={dirty_count}, "
+            f"ahead={local['ahead'] if local['ahead'] is not None else '-'}, "
+            f"behind={local['behind'] if local['behind'] is not None else '-'}"
+        )
+        if local["range"]:
+            lines.append(f"Range: {local['range']}" + ("" if local["range_available"] else " [not present locally]"))
+        for item in local["dirty_files"]:
+            lines.append(f"  dirty {item['status']}: {item['path']}")
+        if local["dirty_files_truncated"]:
+            lines.append(f"  [dirty-file list truncated at {MAX_FILES}]")
+    else:
+        lines.append(f"Local: unavailable ({local['reason']})")
+
+    diff = report["diff"]
+    lines.append("")
+    if not diff["included"]:
+        lines.append("Diff: not included (use --include-diff; output is bounded by --max-diff-chars)")
+    elif not diff["available"]:
+        lines.append("Diff: unavailable (see stderr warning)")
+    else:
+        original = (
+            f">={diff['original_chars']}"
+            if diff["original_chars_is_lower_bound"]
+            else str(diff["original_chars"])
+        )
+        lines.extend([f"Diff ({len(diff['text'])}/{original} chars):", diff["text"]])
+        if diff["truncated"]:
+            lines.append(
+                f"[diff truncated at {diff['limit']} chars; rerun with a larger --max-diff-chars]"
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def bounded_positive_int(maximum: int):
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        if not 1 <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(f"must be between 1 and {maximum}")
+        return parsed
+
+    return parse
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Emit a bounded, read-only report for a GitHub pull request.",
+        epilog=(
+            "PR may be omitted (infer from the current branch), a number, a GitHub PR URL, "
+            "or OWNER/REPO#NUMBER. No fetches or GitHub mutations are performed."
+        ),
+    )
+    parser.add_argument("pr", nargs="?", help="PR number, URL, or OWNER/REPO#NUMBER")
+    parser.add_argument(
+        "--repo",
+        metavar="PATH|OWNER/REPO",
+        help="local Git repository path or GitHub OWNER/REPO",
+    )
+    parser.add_argument("--json", action="store_true", help="emit stable JSON to stdout")
+    parser.add_argument("--include-diff", action="store_true", help="include a bounded PR diff")
+    parser.add_argument(
+        "--max-diff-chars",
+        type=bounded_positive_int(MAX_DIFF_CHARS_LIMIT),
+        default=DEFAULT_MAX_DIFF_CHARS,
+        help=(
+            f"maximum included diff characters (default: {DEFAULT_MAX_DIFF_CHARS}; "
+            f"hard maximum: {MAX_DIFF_CHARS_LIMIT})"
+        ),
+    )
+    parser.add_argument(
+        "--max-comments",
+        type=nonnegative_int,
+        default=DEFAULT_MAX_COMMENTS,
+        help=f"maximum review/comment and thread summaries per section (default: {DEFAULT_MAX_COMMENTS})",
+    )
+    parser.add_argument("--no-local", action="store_true", help="omit local Git status and range comparisons")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = make_parser().parse_args(argv)
+    diagnostics = Diagnostics()
+    try:
+        report = build_report(args, diagnostics)
+    except ContextError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(human_text(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
